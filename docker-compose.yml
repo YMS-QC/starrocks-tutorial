@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:3.2-latest
+    hostname: starrocks-fe
+    container_name: starrocks-fe
+    ports:
+      - "8030:8030"  # Web UI
+      - "9030:9030"  # MySQL协议端口
+      - "9010:9010"  # RPC端口
+    environment:
+      - JAVA_OPTS=-Xmx4g -XX:+UseG1GC
+    volumes:
+      - fe-meta:/opt/starrocks/fe/meta
+      - fe-log:/opt/starrocks/fe/log
+      - ./config/fe.conf:/opt/starrocks/fe/conf/fe.conf:ro
+    networks:
+      - starrocks-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  starrocks-be:
+    image: starrocks/be-ubuntu:3.2-latest
+    hostname: starrocks-be
+    container_name: starrocks-be
+    ports:
+      - "8040:8040"  # Web UI  
+      - "9060:9060"  # 心跳端口
+      - "8060:8060"  # 数据传输端口
+    environment:
+      - JAVA_OPTS=-Xmx8g -XX:+UseG1GC
+    volumes:
+      - be-storage:/opt/starrocks/be/storage
+      - be-log:/opt/starrocks/be/log
+      - ./config/be.conf:/opt/starrocks/be/conf/be.conf:ro
+    networks:
+      - starrocks-network
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # MySQL客户端容器（可选，用于快速连接测试）
+  mysql-client:
+    image: mysql:8.0
+    container_name: mysql-client
+    networks:
+      - starrocks-network
+    depends_on:
+      starrocks-be:
+        condition: service_healthy
+    command: >
+      bash -c "
+        echo 'Waiting for StarRocks to be ready...' &&
+        sleep 30 &&
+        echo 'Connecting to StarRocks...' &&
+        mysql -h starrocks-fe -P 9030 -u root -e 'SHOW DATABASES;' &&
+        echo 'Adding BE to cluster...' &&
+        mysql -h starrocks-fe -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND 'starrocks-be:9050';\" &&
+        echo 'Setup completed. Use: docker exec -it mysql-client mysql -h starrocks-fe -P 9030 -u root' &&
+        tail -f /dev/null
+      "
+    profiles:
+      - tools
+
+  # Adminer数据库管理工具（可选）
+  adminer:
+    image: adminer:latest
+    container_name: starrocks-adminer
+    ports:
+      - "8080:8080"
+    networks:
+      - starrocks-network
+    depends_on:
+      - starrocks-fe
+    profiles:
+      - tools
+
+volumes:
+  fe-meta:
+    driver: local
+  fe-log:
+    driver: local
+  be-storage:
+    driver: local
+  be-log:
+    driver: local
+
+networks:
+  starrocks-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

@@ -180,6 +180,70 @@ starrocks-tutorial/
 - 索引 → StarRocks自动索引
 - 物化视图 → StarRocks物化视图
 
+#### 3.5 MySQL到StarRocks映射
+##### 数据类型映射表
+| MySQL类型 | StarRocks类型 | 说明 |
+|-----------|--------------|------|
+| TINYINT | TINYINT | 1字节整数 |
+| SMALLINT | SMALLINT | 2字节整数 |
+| MEDIUMINT | INT | 3字节转4字节 |
+| INT | INT | 4字节整数 |
+| BIGINT | BIGINT | 8字节整数 |
+| DECIMAL(M,D) | DECIMAL(M,D) | 精确小数 |
+| FLOAT | FLOAT | 单精度浮点 |
+| DOUBLE | DOUBLE | 双精度浮点 |
+| VARCHAR(n) | VARCHAR(n) | 变长字符串 |
+| CHAR(n) | CHAR(n) | 定长字符串 |
+| TEXT/MEDIUMTEXT/LONGTEXT | STRING | 大文本统一为STRING |
+| DATE | DATE | 日期 |
+| DATETIME | DATETIME | 日期时间 |
+| TIMESTAMP | DATETIME | 时间戳转日期时间 |
+| TIME | STRING | 时间转字符串 |
+| YEAR | SMALLINT | 年份转小整数 |
+| JSON | JSON/STRING | JSON类型 |
+| BINARY/VARBINARY | STRING | 二进制转字符串 |
+| BLOB | STRING | 二进制大对象转字符串 |
+| ENUM | VARCHAR | 枚举转字符串 |
+| SET | VARCHAR | 集合转字符串 |
+
+##### MySQL特性迁移
+- **AUTO_INCREMENT** → StarRocks AUTO_INCREMENT
+- **主键约束** → Unique模型的主键
+- **唯一索引** → Unique模型或Duplicate模型+应用层去重
+- **外键约束** → 应用层维护（StarRocks不支持外键）
+- **触发器** → 应用层实现或Stream Load前处理
+- **存储过程/函数** → 改写为StarRocks SQL或应用层逻辑
+- **视图** → StarRocks视图
+- **分区表** → Range/List分区（需重新设计）
+- **全文索引** → 暂不支持，使用LIKE或外部搜索引擎
+
+##### MySQL到StarRocks注意事项
+###### 字符集处理
+- MySQL默认utf8mb4 → StarRocks默认UTF-8
+- 特殊字符和emoji支持需要测试验证
+- 排序规则(Collation)差异需要注意
+
+###### NULL值处理
+- StarRocks的NULL处理与MySQL基本一致
+- 聚合函数对NULL的处理相同
+- 注意Unique模型中NULL值的特殊处理
+
+###### 事务差异
+- MySQL支持完整ACID事务
+- StarRocks主要支持单表事务，不支持跨表事务
+- 批量导入具有原子性（全部成功或全部失败）
+
+###### 性能优化差异
+- MySQL依赖索引优化
+- StarRocks依赖分区分桶和列式存储
+- 查询优化器行为不同，需要重新调优
+
+###### SQL语法差异
+- 部分MySQL特有函数需要改写
+- GROUP BY行为差异（MySQL 5.7后的ONLY_FULL_GROUP_BY）
+- 窗口函数语法基本兼容
+- 存储过程需要改写为普通SQL
+
 ### 第4章：Kettle集成（实战章节）
 
 #### 4.1 环境配置
@@ -335,6 +399,113 @@ SELECT BITMAP_UNION_COUNT(to_bitmap(user_id)) FROM orders
 - 数据迁移工具选择
 - 性能对比测试
 - 兼容性问题处理
+
+#### 7.2 MySQL迁移最佳实践
+##### 迁移前评估
+- **数据量评估**：统计表大小、记录数、增长速度
+- **查询模式分析**：识别高频查询、复杂Join、聚合需求
+- **性能基准测试**：记录当前MySQL性能指标作为对比基准
+- **依赖关系梳理**：外键、触发器、存储过程的使用情况
+
+##### 迁移工具选择
+###### 1. MySQL Binlog + Flink CDC
+```
+MySQL Binlog → Flink CDC → StarRocks
+```
+- 适用场景：实时同步、增量迁移
+- 优点：低延迟、自动捕获变更
+- 缺点：需要Flink环境、配置复杂
+
+###### 2. DataX + Stream Load
+```
+MySQL → DataX → Stream Load → StarRocks
+```
+- 适用场景：批量迁移、定时同步
+- 优点：配置简单、性能稳定
+- 缺点：批处理延迟
+
+###### 3. Kettle + JDBC
+```
+MySQL → Kettle → JDBC/Stream Load → StarRocks
+```
+- 适用场景：复杂转换、数据清洗
+- 优点：可视化配置、转换能力强
+- 缺点：性能相对较低
+
+###### 4. mysqldump + Stream Load
+```
+mysqldump → CSV → Stream Load → StarRocks
+```
+- 适用场景：一次性全量迁移
+- 优点：简单直接、无需额外工具
+- 缺点：不支持增量、大表导出慢
+
+##### MySQL特有优化
+###### 连接池配置
+```properties
+# Kettle数据库连接池优化
+initialSize=10
+maxActive=50
+maxIdle=20
+minIdle=10
+maxWait=10000
+validationQuery=SELECT 1
+testOnBorrow=true
+testWhileIdle=true
+```
+
+###### 批量读取优化
+```sql
+-- 使用流式查询避免OOM
+SET SESSION net_write_timeout = 600;
+SET SESSION net_read_timeout = 600;
+-- JDBC URL添加参数
+jdbc:mysql://host:3306/db?useCursorFetch=true&defaultFetchSize=5000
+```
+
+###### 并行抽取策略
+- 按主键范围分片
+- 按时间分区并行
+- 按哈希值分桶
+
+##### 常见问题处理
+###### 字符集乱码
+```sql
+-- 确保字符集一致
+ALTER DATABASE db_name CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+-- JDBC URL指定字符集
+jdbc:mysql://host:3306/db?characterEncoding=UTF-8
+```
+
+###### 时区问题
+```sql
+-- MySQL时区设置
+SET time_zone = '+08:00';
+-- StarRocks时区设置
+SET global time_zone = 'Asia/Shanghai';
+-- JDBC URL处理
+jdbc:mysql://host:3306/db?serverTimezone=Asia/Shanghai
+```
+
+###### 大表迁移
+- 分批迁移：每批100万-500万条
+- 使用分区表：按时间或ID范围分区
+- 避免长事务：控制单次导入时间
+- 监控资源：关注CPU、内存、网络
+
+##### 数据一致性验证
+```sql
+-- 行数对比
+SELECT COUNT(*) FROM mysql_table;
+SELECT COUNT(*) FROM starrocks_table;
+
+-- 数据抽样对比
+SELECT MD5(GROUP_CONCAT(column_name ORDER BY id)) 
+FROM (SELECT * FROM table LIMIT 10000) t;
+
+-- 聚合值对比
+SELECT SUM(amount), COUNT(DISTINCT user_id) FROM table;
+```
 
 #### 7.2 Kettle作业最佳实践
 - 作业设计规范
