@@ -600,37 +600,481 @@ echo "" >> "$PERF_LOG"
 echo "详细报告已生成: $PERF_LOG"
 ```
 
-## 7. 最佳实践总结
+## 7. Aggregate 表配合循环的高级场景
 
-### 7.1 分片策略选择
+### 7.1 多年数据按月聚合场景
+
+在数据仓库场景中，经常需要将三年的明细数据按月聚合到 StarRocks 的 Aggregate 模型表中。虽然可以一次性聚合整年的数据，但为了避免内存压力和提高处理效率，通常采用循环方式分批处理。
+
+#### 场景描述
+- **数据源**：3年的订单明细数据（约1亿条记录）
+- **目标表**：Aggregate 模型的年度汇总表
+- **处理策略**：按月循环，逐月聚合到年度表中
+- **聚合逻辑**：不是简单的数据导入，而是利用 Aggregate 模型的预聚合特性
+
+#### 目标 Aggregate 表设计
+
+```sql
+-- 年度销售汇总表（Aggregate模型）
+CREATE TABLE yearly_sales_summary (
+    year INT NOT NULL,
+    region VARCHAR(50) NOT NULL,
+    product_category VARCHAR(50) NOT NULL,
+    
+    -- 聚合指标列
+    total_amount SUM DECIMAL(18,2) DEFAULT "0" COMMENT "年度总销售额",
+    order_count SUM BIGINT DEFAULT "0" COMMENT "年度订单数",
+    avg_order_value REPLACE DECIMAL(10,2) DEFAULT "0" COMMENT "平均订单价值",
+    max_single_order MAX DECIMAL(10,2) DEFAULT "0" COMMENT "单笔最高订单",
+    unique_customers HLL HLL_UNION COMMENT "年度活跃客户数",
+    monthly_peak MAX DECIMAL(15,2) DEFAULT "0" COMMENT "月度销售峰值"
+)
+AGGREGATE KEY(year, region, product_category)
+DISTRIBUTED BY HASH(region) BUCKETS 10
+PROPERTIES ("replication_num" = "3");
+```
+
+### 7.2 Kettle 循环聚合实现
+
+#### 主 Job 设计
+
+```xml
+<job>
+    <name>Yearly Aggregation with Monthly Loop</name>
+    
+    <!-- 初始化参数 -->
+    <entry>
+        <name>Initialize Parameters</name>
+        <type>EVAL</type>
+        <script>
+            // 设置处理年份和月份范围
+            parent_job.setVariable("TARGET_YEAR", "2023");
+            parent_job.setVariable("START_MONTH", "1");
+            parent_job.setVariable("END_MONTH", "12");
+            parent_job.setVariable("CURRENT_MONTH", "1");
+            
+            // 聚合模式标识
+            parent_job.setVariable("AGGREGATE_MODE", "true");
+            parent_job.setVariable("BATCH_SIZE", "100000");
+        </script>
+    </entry>
+    
+    <!-- 清理目标年份的历史数据 -->
+    <entry>
+        <name>Clean Target Year Data</name>
+        <type>SQL</type>
+        <sql>
+            DELETE FROM yearly_sales_summary 
+            WHERE year = ${TARGET_YEAR}
+        </sql>
+    </entry>
+    
+    <!-- 月份循环处理 -->
+    <entry>
+        <name>Monthly Loop Controller</name>
+        <type>EVAL</type>
+        <script>
+            var current_month = parseInt(getVariable("CURRENT_MONTH", "1"));
+            var end_month = parseInt(getVariable("END_MONTH", "12"));
+            var target_year = getVariable("TARGET_YEAR");
+            
+            if (current_month <= end_month) {
+                // 设置当前处理月份的参数
+                parent_job.setVariable("PROCESSING_YEAR", target_year);
+                parent_job.setVariable("PROCESSING_MONTH", current_month.toString().padStart(2, '0'));
+                parent_job.setVariable("MONTH_NAME", target_year + "-" + current_month.toString().padStart(2, '0'));
+                
+                writeToLog("i", "开始处理 " + target_year + " 年 " + current_month + " 月的数据聚合");
+                should_continue = true;
+            } else {
+                writeToLog("i", "所有月份处理完成");
+                should_continue = false;
+            }
+        </script>
+        <next>Process Monthly Data</next>
+    </entry>
+    
+    <!-- 处理单月数据 -->
+    <entry>
+        <name>Process Monthly Data</name>
+        <type>TRANS</type>
+        <filename>monthly_aggregate_processor.ktr</filename>
+        <parameters>
+            <parameter><name>YEAR</name><value>${PROCESSING_YEAR}</value></parameter>
+            <parameter><name>MONTH</name><value>${PROCESSING_MONTH}</value></parameter>
+            <parameter><name>MONTH_NAME</name><value>${MONTH_NAME}</value></parameter>
+        </parameters>
+        <next>Increment Month</next>
+    </entry>
+    
+    <!-- 递增月份 -->
+    <entry>
+        <name>Increment Month</name>
+        <type>EVAL</type>
+        <script>
+            var current_month = parseInt(getVariable("CURRENT_MONTH"));
+            current_month++;
+            parent_job.setVariable("CURRENT_MONTH", current_month.toString());
+        </script>
+        <next>Monthly Loop Controller</next>
+    </entry>
+    
+    <!-- 最终汇总验证 -->
+    <entry>
+        <name>Final Summary Validation</name>
+        <type>SQL</type>
+        <sql>
+            SELECT 
+                year,
+                COUNT(*) as dimension_count,
+                SUM(total_amount) as total_yearly_amount,
+                SUM(order_count) as total_yearly_orders
+            FROM yearly_sales_summary 
+            WHERE year = ${TARGET_YEAR}
+            GROUP BY year
+        </sql>
+    </entry>
+</job>
+```
+
+#### 月度聚合转换（monthly_aggregate_processor.ktr）
+
+```xml
+<transformation>
+    <name>monthly_aggregate_processor</name>
+    
+    <!-- 读取月度明细数据 -->
+    <step>
+        <name>Read Monthly Orders</name>
+        <type>TableInput</type>
+        <sql>
+            SELECT 
+                ${YEAR} as year,
+                u.region,
+                p.category as product_category,
+                o.order_amount,
+                o.order_id,
+                o.user_id,
+                -- 预先计算月度峰值
+                SUM(o.order_amount) OVER (
+                    PARTITION BY u.region, p.category 
+                    ORDER BY o.order_date
+                ) as running_monthly_total
+            FROM orders o
+            JOIN users u ON o.user_id = u.user_id  
+            JOIN products p ON o.product_id = p.product_id
+            WHERE o.order_date >= '${YEAR}-${MONTH}-01'
+              AND o.order_date < '${YEAR}-${MONTH}-01'::DATE + INTERVAL '1 month'
+              AND o.status = 'COMPLETED'
+            ORDER BY u.region, p.category, o.order_date
+        </sql>
+    </step>
+    
+    <!-- 月度数据预聚合 -->
+    <step>
+        <name>Monthly Pre-Aggregation</name>
+        <type>GroupBy</type>
+        <group>
+            <field><name>year</name></field>
+            <field><name>region</name></field> 
+            <field><name>product_category</name></field>
+        </group>
+        <fields>
+            <!-- 利用 Aggregate 模型的 SUM 特性 -->
+            <field>
+                <name>monthly_amount</name>
+                <aggregate>SUM</aggregate>
+                <subject>order_amount</subject>
+            </field>
+            <field>
+                <name>monthly_orders</name>
+                <aggregate>COUNT</aggregate>
+                <subject>order_id</subject>
+            </field>
+            <field>
+                <name>avg_order_value</name>
+                <aggregate>AVERAGE</aggregate>
+                <subject>order_amount</subject>
+            </field>
+            <field>
+                <name>max_single_order</name>
+                <aggregate>MAXIMUM</aggregate>
+                <subject>order_amount</subject>
+            </field>
+            <field>
+                <name>monthly_peak</name>
+                <aggregate>MAXIMUM</aggregate>
+                <subject>running_monthly_total</subject>
+            </field>
+        </fields>
+    </step>
+    
+    <!-- HLL 用户去重计算 -->
+    <step>
+        <name>Calculate HLL Users</name>
+        <type>Calculator</type>
+        <calculation>
+            <field_name>unique_customers</field_name>
+            <calc_type>HLL_HASH</calc_type>
+            <field_a>user_id</field_a>
+        </calculation>
+    </step>
+    
+    <!-- 写入 Aggregate 表（自动聚合） -->
+    <step>
+        <name>Write to Aggregate Table</name>
+        <type>TableOutput</type>
+        <table>yearly_sales_summary</table>
+        <commit_size>1000</commit_size>
+        <use_batch>Y</use_batch>
+        <!-- 关键：利用 INSERT 让 StarRocks 自动聚合 -->
+        <insert_only>N</insert_only>
+    </step>
+    
+    <!-- 处理进度日志 -->
+    <step>
+        <name>Log Processing Progress</name>
+        <type>WriteToLog</type>
+        <loglevel>Basic</loglevel>
+        <displayHeader>Y</displayHeader>
+        <limitRows>N</limitRows>
+        <fields>
+            <field><name>year</name></field>
+            <field><name>region</name></field>
+            <field><name>product_category</name></field>
+            <field><name>monthly_amount</name></field>
+            <field><name>monthly_orders</name></field>
+        </fields>
+    </step>
+</transformation>
+```
+
+### 7.3 Aggregate 模型的关键机制
+
+#### 自动聚合原理
+
+当向 Aggregate 表插入数据时，StarRocks 会自动进行聚合：
+
+```sql
+-- 第一次插入（1月数据）
+INSERT INTO yearly_sales_summary VALUES 
+(2023, '北京', '电子产品', 100000, 500, 200, 1500, hll_hash(12345), 100000);
+
+-- 第二次插入（2月数据）- StarRocks 自动与1月数据聚合
+INSERT INTO yearly_sales_summary VALUES 
+(2023, '北京', '电子产品', 120000, 600, 200, 1800, hll_hash(12346), 120000);
+
+-- 结果：StarRocks 自动合并为
+-- (2023, '北京', '电子产品', 220000, 1100, 200, 1800, hll_union(...), 120000)
+```
+
+#### 聚合函数行为说明
+
+```javascript
+// Kettle 中的聚合逻辑理解
+var aggregation_rules = {
+    "SUM": "多次插入的值会累加",
+    "MAX": "保留所有插入中的最大值", 
+    "MIN": "保留所有插入中的最小值",
+    "REPLACE": "使用最后一次插入的值",
+    "HLL_UNION": "合并HLL集合，保持去重特性",
+    "BITMAP_UNION": "合并BITMAP集合，精确去重"
+};
+
+writeToLog("i", "Aggregate 模型会在插入时自动应用这些聚合规则");
+```
+
+### 7.4 循环处理的优化策略
+
+#### 内存管理
+
+```xml
+<!-- 优化的转换配置 -->
+<transformation>
+    <info>
+        <name>memory_optimized_aggregation</name>
+        <!-- 控制步骤缓存大小 -->
+        <step_performance_capturing_enabled>Y</step_performance_capturing_enabled>
+        <step_performance_capturing_size_limit>1000</step_performance_capturing_size_limit>
+    </info>
+    
+    <!-- 分批读取避免内存溢出 -->
+    <step>
+        <name>Batched Monthly Read</name>
+        <type>TableInput</type>
+        <limit>50000</limit>  <!-- 限制单批次读取量 -->
+        <sql>
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (ORDER BY order_date) as rn
+                FROM orders 
+                WHERE order_date >= '${YEAR}-${MONTH}-01'
+                  AND order_date < '${YEAR}-${MONTH}-01'::DATE + INTERVAL '1 month'
+            ) t 
+            WHERE rn BETWEEN ${OFFSET} AND ${OFFSET} + 50000
+        </sql>
+    </step>
+</transformation>
+```
+
+#### 错误处理和重试
+
+```javascript
+// 月度处理错误恢复
+function handleMonthlyProcessError() {
+    var current_month = parseInt(getVariable("CURRENT_MONTH"));
+    var error_count = parseInt(getVariable("MONTH_ERROR_COUNT", "0"));
+    
+    if (error_count < 3) {
+        // 重试当前月份
+        writeToLog("w", "月份 " + current_month + " 处理失败，第 " + (error_count + 1) + " 次重试");
+        setVariable("MONTH_ERROR_COUNT", (error_count + 1).toString());
+        
+        // 清理当前月份的部分数据
+        executeSQL("DELETE FROM yearly_sales_summary WHERE year = " + 
+                  getVariable("TARGET_YEAR") + " AND month_flag = " + current_month);
+        
+        return "RETRY_CURRENT_MONTH";
+    } else {
+        // 跳过当前月份，记录错误
+        writeToLog("e", "月份 " + current_month + " 多次失败，跳过处理");
+        setVariable("MONTH_ERROR_COUNT", "0");
+        setVariable("CURRENT_MONTH", (current_month + 1).toString());
+        
+        return "SKIP_TO_NEXT_MONTH";
+    }
+}
+```
+
+### 7.5 性能监控和验证
+
+#### 聚合结果验证
+
+```sql
+-- 验证聚合的正确性
+-- 1. 检查每个维度的数据完整性
+SELECT 
+    year,
+    region, 
+    product_category,
+    total_amount,
+    order_count,
+    ROUND(total_amount / order_count, 2) as calculated_avg
+FROM yearly_sales_summary 
+WHERE year = 2023
+ORDER BY total_amount DESC;
+
+-- 2. 与原始数据对比验证
+SELECT 
+    'source' as data_type,
+    2023 as year,
+    u.region,
+    p.category,
+    SUM(o.order_amount) as total_amount,
+    COUNT(*) as order_count
+FROM orders o
+JOIN users u ON o.user_id = u.user_id
+JOIN products p ON o.product_id = p.product_id  
+WHERE YEAR(o.order_date) = 2023
+GROUP BY u.region, p.category
+
+UNION ALL
+
+SELECT 
+    'aggregated' as data_type,
+    year,
+    region,
+    product_category,
+    total_amount,
+    order_count
+FROM yearly_sales_summary 
+WHERE year = 2023;
+```
+
+#### 处理效率监控
+
+```javascript
+// 性能监控脚本
+var start_time = new Date().getTime();
+
+// ... 处理逻辑 ...
+
+var end_time = new Date().getTime();
+var process_time = end_time - start_time;
+var records_processed = parseInt(getVariable("RECORDS_PROCESSED", "0"));
+
+var performance_metrics = {
+    "month": getVariable("PROCESSING_MONTH"),
+    "processing_time_sec": Math.round(process_time / 1000),
+    "records_processed": records_processed,
+    "records_per_second": Math.round(records_processed / (process_time / 1000)),
+    "memory_usage_mb": getMemoryUsage()
+};
+
+writeToLog("i", "月度处理性能: " + JSON.stringify(performance_metrics));
+```
+
+### 7.6 最佳实践要点
+
+#### Aggregate 模型使用建议
+
+1. **聚合键设计**
+   - 选择业务中真正需要分析的维度作为聚合键
+   - 聚合键的组合基数不宜过高（建议 < 1000万）
+   - 按查询频率调整聚合键顺序
+
+2. **循环粒度选择**
+   - 按月循环：平衡内存使用和处理效率
+   - 按周循环：适合实时性要求较高的场景
+   - 按日循环：用于增量更新场景
+
+3. **资源控制**
+   - 单次循环的数据量控制在 100MB-1GB
+   - 合理设置 Kettle 的 commit_size（建议1000-10000）
+   - 监控 StarRocks 的 compaction 状态
+
+4. **数据质量保证**
+   - 在每个循环后验证聚合结果
+   - 实现断点续传机制
+   - 建立完整的错误日志和告警
+
+通过这种 Aggregate 表配合循环的方式，可以高效处理大规模历史数据的聚合场景，充分利用 StarRocks 预聚合的优势。
+
+## 8. 最佳实践总结
+
+### 8.1 分片策略选择
 - **历史数据迁移**：优先使用时间范围分片，与 StarRocks 分区策略对应
 - **大表全量同步**：使用主键范围分片，确保数据完整性
 - **实时数据处理**：使用 Hash 分片，保证负载均衡
+- **聚合场景**：使用时间循环分片，配合 Aggregate 模型实现高效预聚合
 
-### 7.2 并行度设置
+### 8.2 并行度设置
 - **CPU 密集型**：并行度 = CPU 核心数
 - **I/O 密集型**：并行度 = CPU 核心数 × 2
 - **内存受限型**：根据可用内存动态调整
+- **聚合计算型**：适度降低并行度，避免聚合冲突
 
-### 7.3 资源管理要点
+### 8.3 资源管理要点
 - 设置合理的 JVM 堆内存，通常为系统内存的 60-70%
 - 使用连接池避免频繁创建数据库连接
 - 实施流量控制，防止系统过载
 - 定期监控和清理临时文件
+- Aggregate 场景需监控 StarRocks compaction 状态
 
-### 7.4 错误处理策略
+### 8.4 错误处理策略
 - 实现分片级错误隔离，单个分片失败不影响整体
 - 采用指数退避重试策略，避免雪崩效应
 - 支持断点续传，提高处理效率
 - 建立完善的监控告警机制
+- Aggregate 场景需要数据一致性验证
 
-### 7.5 性能调优建议
+### 8.5 性能调优建议
 - 定期分析性能指标，识别瓶颈点
 - 优化 SQL 查询，使用合适的索引
 - 调整批量大小，平衡内存使用和处理效率
 - 使用 Stream Load 替代 INSERT 提升写入性能
+- Aggregate 场景优化聚合键设计和分桶策略
 
-通过合理的批量处理策略，可以显著提升大数据量的 ETL 处理效率和系统稳定性。
+通过合理的批量处理策略，特别是结合 StarRocks Aggregate 模型的预聚合特性，可以显著提升大数据量的 ETL 处理效率和系统稳定性。
 
 ---
 ## 📖 导航
