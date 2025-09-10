@@ -1,6 +1,6 @@
 ---
 ## 📖 导航
-[🏠 返回主页](../../README.md) | [⬅️ 上一页](batch-processing-strategies.md) | [➡️ 下一页](../05-sql-optimization/query-analysis.md)
+[🏠 返回主页](../../README.md) | [⬅️ 上一页](kettle-scripting.md) | [➡️ 下一页](../05-sql-optimization/query-analysis.md)
 ---
 
 # 错误处理机制
@@ -1158,5 +1158,5 @@ function executeBatchTransaction(source_table, target_table, batch_size) {
 
 ---
 ## 📖 导航
-[🏠 返回主页](../../README.md) | [⬅️ 上一页](batch-processing-strategies.md) | [➡️ 下一页](../05-sql-optimization/query-analysis.md)
+[🏠 返回主页](../../README.md) | [⬅️ 上一页](kettle-scripting.md) | [➡️ 下一页](../05-sql-optimization/query-analysis.md)
 ---

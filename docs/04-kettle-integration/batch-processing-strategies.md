@@ -1,6 +1,6 @@
 ---
 ## 📖 导航
-[🏠 返回主页](../../README.md) | [⬅️ 上一页](modern-etl-tools.md) | [➡️ 下一页](error-handling-mechanisms.md)
+[🏠 返回主页](../../README.md) | [⬅️ 上一页](modern-etl-tools.md) | [➡️ 下一页](kettle-scripting.md)
 ---
 
 # 批量处理策略
@@ -634,5 +634,5 @@ echo "详细报告已生成: $PERF_LOG"
 
 ---
 ## 📖 导航
-[🏠 返回主页](../../README.md) | [⬅️ 上一页](modern-etl-tools.md) | [➡️ 下一页](error-handling-mechanisms.md)
+[🏠 返回主页](../../README.md) | [⬅️ 上一页](modern-etl-tools.md) | [➡️ 下一页](kettle-scripting.md)
 ---
