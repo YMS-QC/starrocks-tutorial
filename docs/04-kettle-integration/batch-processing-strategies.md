@@ -600,37 +600,458 @@ echo "" >> "$PERF_LOG"
 echo "详细报告已生成: $PERF_LOG"
 ```
 
-## 7. 最佳实践总结
+## 7. 聚合表配合循环处理
 
-### 7.1 分片策略选择
+### 7.1 场景描述
+
+在实际的数据仓库项目中，经常需要处理历史数据的聚合场景：
+- **数据源**：三年的明细数据，按月分批存储
+- **目标表**：StarRocks Aggregate 聚合模型表，按年度聚合
+- **处理策略**：分月多次聚合到目标表，而不是一次性处理全年数据
+
+这种场景特别适合使用 Kettle 循环机制配合 StarRocks 聚合模型来实现。
+
+### 7.2 聚合表设计
+
+首先设计 StarRocks 聚合模型表结构：
+
+```sql
+-- 年度销售聚合表
+CREATE TABLE annual_sales_summary (
+    year_id INT NOT NULL,
+    region_code VARCHAR(50) NOT NULL,
+    product_category VARCHAR(100) NOT NULL,
+    total_sales DECIMAL(18,2) SUM DEFAULT "0",
+    total_orders BIGINT SUM DEFAULT "0", 
+    avg_order_amount DECIMAL(10,2) REPLACE DEFAULT "0",
+    max_single_order DECIMAL(10,2) MAX DEFAULT "0",
+    min_single_order DECIMAL(10,2) MIN DEFAULT "999999",
+    last_updated DATETIME REPLACE DEFAULT CURRENT_TIMESTAMP
+) ENGINE=OLAP
+AGGREGATE KEY(year_id, region_code, product_category)
+COMMENT "年度销售数据聚合表"
+DISTRIBUTED BY HASH(year_id, region_code) BUCKETS 8
+PROPERTIES (
+    "replication_num" = "3",
+    "enable_persistent_index" = "true"
+);
+```
+
+### 7.3 Kettle 循环处理实现
+
+#### 7.3.1 主控循环 Job 设计
+
+```xml
+<job>
+    <name>Annual Aggregation with Monthly Loop</name>
+    
+    <!-- 初始化年度和月份参数 -->
+    <entry>
+        <name>Initialize Parameters</name>
+        <type>EVAL</type>
+        <script>
+            // 设置要处理的年份范围
+            var startYear = 2021;
+            var endYear = 2023;
+            var currentYear = startYear;
+            
+            parent_job.setVariable("START_YEAR", startYear.toString());
+            parent_job.setVariable("END_YEAR", endYear.toString());
+            parent_job.setVariable("CURRENT_YEAR", currentYear.toString());
+            
+            // 月份循环参数
+            parent_job.setVariable("START_MONTH", "1");
+            parent_job.setVariable("END_MONTH", "12");
+            parent_job.setVariable("CURRENT_MONTH", "1");
+            
+            writeToLog("i", "开始处理年度聚合，年份范围：" + startYear + " - " + endYear);
+        </script>
+    </entry>
+    
+    <!-- 年度循环开始 -->
+    <entry>
+        <name>Year Loop Start</name>
+        <type>SIMPLE_EVAL</type>
+        <script>
+            var currentYear = parseInt(parent_job.getVariable("CURRENT_YEAR"));
+            var endYear = parseInt(parent_job.getVariable("END_YEAR"));
+            
+            if (currentYear <= endYear) {
+                writeToLog("i", "开始处理年份：" + currentYear);
+                // 重置月份循环
+                parent_job.setVariable("CURRENT_MONTH", "1");
+                result = true;
+            } else {
+                writeToLog("i", "年度循环结束");
+                result = false;
+            }
+        </script>
+        <on_success>Month Loop Start</on_success>
+        <on_failure>Job End</on_failure>
+    </entry>
+    
+    <!-- 月份循环开始 -->
+    <entry>
+        <name>Month Loop Start</name>
+        <type>SIMPLE_EVAL</type>
+        <script>
+            var currentMonth = parseInt(parent_job.getVariable("CURRENT_MONTH"));
+            var endMonth = parseInt(parent_job.getVariable("END_MONTH"));
+            var currentYear = parent_job.getVariable("CURRENT_YEAR");
+            
+            if (currentMonth <= endMonth) {
+                var monthStr = currentMonth < 10 ? "0" + currentMonth : currentMonth.toString();
+                writeToLog("i", "处理月份：" + currentYear + "-" + monthStr);
+                parent_job.setVariable("CURRENT_MONTH_STR", monthStr);
+                result = true;
+            } else {
+                writeToLog("i", "当前年份月份循环结束，进入下一年");
+                result = false;
+            }
+        </script>
+        <on_success>Process Monthly Aggregation</on_success>
+        <on_failure>Next Year</on_failure>
+    </entry>
+    
+    <!-- 执行月度聚合 -->
+    <entry>
+        <name>Process Monthly Aggregation</name>
+        <type>TRANS</type>
+        <filename>monthly_aggregate_processor.ktr</filename>
+        <parameters>
+            <parameter><name>PROCESS_YEAR</name><value>${CURRENT_YEAR}</value></parameter>
+            <parameter><name>PROCESS_MONTH</name><value>${CURRENT_MONTH_STR}</value></parameter>
+        </parameters>
+        <on_success>Next Month</on_success>
+        <on_failure>Handle Month Error</on_failure>
+    </entry>
+    
+    <!-- 处理下个月 -->
+    <entry>
+        <name>Next Month</name>
+        <type>SIMPLE_EVAL</type>
+        <script>
+            var currentMonth = parseInt(parent_job.getVariable("CURRENT_MONTH")) + 1;
+            parent_job.setVariable("CURRENT_MONTH", currentMonth.toString());
+        </script>
+        <on_success>Month Loop Start</on_success>
+    </entry>
+    
+    <!-- 处理下一年 -->
+    <entry>
+        <name>Next Year</name>
+        <type>SIMPLE_EVAL</type>
+        <script>
+            var currentYear = parseInt(parent_job.getVariable("CURRENT_YEAR")) + 1;
+            parent_job.setVariable("CURRENT_YEAR", currentYear.toString());
+        </script>
+        <on_success>Year Loop Start</on_success>
+    </entry>
+    
+    <!-- 月份处理错误 -->
+    <entry>
+        <name>Handle Month Error</name>
+        <type>MAIL</type>
+        <subject>月度聚合处理失败</subject>
+        <message>年份 ${CURRENT_YEAR} 月份 ${CURRENT_MONTH_STR} 聚合处理失败</message>
+        <on_success>Next Month</on_success>
+    </entry>
+</job>
+```
+
+#### 7.3.2 月度聚合处理转换
+
+```xml
+<transformation>
+    <name>monthly_aggregate_processor</name>
+    
+    <!-- 读取月度明细数据 -->
+    <step>
+        <name>Read Monthly Detail Data</name>
+        <type>TableInput</type>
+        <connection>Source_Database</connection>
+        <sql>
+            SELECT 
+                ${PROCESS_YEAR} as year_id,
+                region_code,
+                product_category,
+                SUM(sale_amount) as monthly_sales,
+                COUNT(*) as monthly_orders,
+                AVG(sale_amount) as avg_order_amount,
+                MAX(sale_amount) as max_single_order,
+                MIN(sale_amount) as min_single_order,
+                NOW() as last_updated
+            FROM sales_detail 
+            WHERE DATE_FORMAT(order_date, '%Y-%m') = '${PROCESS_YEAR}-${PROCESS_MONTH}'
+            GROUP BY region_code, product_category
+            HAVING SUM(sale_amount) > 0
+        </sql>
+    </step>
+    
+    <!-- 数据验证 -->
+    <step>
+        <name>Validate Monthly Data</name>
+        <type>FilterRows</type>
+        <condition>
+            <field>monthly_sales</field>
+            <function>></function>
+            <value>0</value>
+        </condition>
+        <send_true_to>Transform for StarRocks</send_true_to>
+        <send_false_to>Log Invalid Data</send_false_to>
+    </step>
+    
+    <!-- 记录无效数据 -->
+    <step>
+        <name>Log Invalid Data</name>
+        <type>WriteToLog</type>
+        <loglevel>error</loglevel>
+        <displayHeader>Y</displayHeader>
+        <logmessage>发现无效的月度数据：年份=${PROCESS_YEAR}, 月份=${PROCESS_MONTH}</logmessage>
+    </step>
+    
+    <!-- 转换为 StarRocks 聚合格式 -->
+    <step>
+        <name>Transform for StarRocks</name>
+        <type>SelectValues</type>
+        <fields>
+            <field><name>year_id</name><rename>year_id</rename><type>Integer</type></field>
+            <field><name>region_code</name><rename>region_code</rename><type>String</type><length>50</length></field>
+            <field><name>product_category</name><rename>product_category</rename><type>String</type><length>100</length></field>
+            <field><name>monthly_sales</name><rename>total_sales</rename><type>BigNumber</type><precision>18</precision><scale>2</scale></field>
+            <field><name>monthly_orders</name><rename>total_orders</rename><type>Integer</type></field>
+            <field><name>avg_order_amount</name><rename>avg_order_amount</rename><type>BigNumber</type><precision>10</precision><scale>2</scale></field>
+            <field><name>max_single_order</name><rename>max_single_order</rename><type>BigNumber</type><precision>10</precision><scale>2</scale></field>
+            <field><name>min_single_order</name><rename>min_single_order</rename><type>BigNumber</type><precision>10</precision><scale>2</scale></field>
+            <field><name>last_updated</name><rename>last_updated</rename><type>Date</type></field>
+        </fields>
+    </step>
+    
+    <!-- 写入 StarRocks 聚合表 -->
+    <step>
+        <name>Load to StarRocks Aggregate Table</name>
+        <type>TableOutput</type>
+        <connection>StarRocks_Connection</connection>
+        <table>annual_sales_summary</table>
+        <commit_size>1000</commit_size>
+        <use_batch>Y</use_batch>
+        <batch_size>1000</batch_size>
+    </step>
+    
+    <!-- 记录处理统计 -->
+    <step>
+        <name>Log Processing Statistics</name>
+        <type>WriteToLog</type>
+        <loglevel>basic</loglevel>
+        <logmessage>月度聚合完成 - 年份: ${PROCESS_YEAR}, 月份: ${PROCESS_MONTH}, 处理记录数: #</logmessage>
+    </step>
+</transformation>
+```
+
+### 7.4 聚合模型特殊处理要点
+
+#### 7.4.1 聚合函数选择策略
+
+```sql
+-- 不同业务指标的聚合函数选择
+CREATE TABLE business_metrics_agg (
+    time_period VARCHAR(20),
+    metric_name VARCHAR(100),
+    
+    -- SUM：累加类指标（销售额、订单量等）
+    total_amount DECIMAL(18,2) SUM DEFAULT "0",
+    order_count BIGINT SUM DEFAULT "0",
+    
+    -- MAX：最大值指标（最高单价、峰值等）
+    max_order_amount DECIMAL(18,2) MAX DEFAULT "0",
+    peak_concurrent_users INT MAX DEFAULT "0",
+    
+    -- MIN：最小值指标（最低价格等）
+    min_order_amount DECIMAL(18,2) MIN DEFAULT "999999",
+    
+    -- REPLACE：替换类指标（最新状态、平均值等）
+    latest_status VARCHAR(50) REPLACE DEFAULT "unknown",
+    avg_rating DECIMAL(3,2) REPLACE DEFAULT "0",
+    
+    -- REPLACE_IF_NOT_NULL：非空替换
+    last_update_time DATETIME REPLACE_IF_NOT_NULL DEFAULT "1900-01-01 00:00:00"
+) ENGINE=OLAP
+AGGREGATE KEY(time_period, metric_name)
+DISTRIBUTED BY HASH(time_period) BUCKETS 4;
+```
+
+#### 7.4.2 Kettle 中的聚合处理逻辑
+
+```javascript
+// 在 JavaScript 步骤中处理复杂聚合逻辑
+var currentSales = parseFloat(getVariable("CURRENT_SALES", "0"));
+var newMonthlySales = parseFloat(monthly_sales);
+
+// 累计计算年度销售额
+var yearToDateSales = currentSales + newMonthlySales;
+setVariable("CURRENT_SALES", yearToDateSales.toString());
+
+// 计算同比增长率
+var lastYearSales = parseFloat(getVariable("LAST_YEAR_SALES", "0"));
+var growthRate = lastYearSales > 0 ? (yearToDateSales - lastYearSales) / lastYearSales * 100 : 0;
+
+// 输出聚合结果
+total_sales = yearToDateSales;
+growth_rate = Math.round(growthRate * 100) / 100;  // 保留两位小数
+
+writeToLog("i", "年度累计销售额: " + yearToDateSales + ", 同比增长: " + growthRate + "%");
+```
+
+### 7.5 性能优化策略
+
+#### 7.5.1 批量加载优化
+
+```sql
+-- 使用 Stream Load 进行高效批量写入
+curl --location-trusted -u root: \
+    -H "label:aggregate_load_$(date +%s)" \
+    -H "column_separator:," \
+    -H "skip_header:1" \
+    -H "max_filter_ratio:0.1" \
+    -H "timeout:300" \
+    -T monthly_aggregate_${PROCESS_YEAR}_${PROCESS_MONTH}.csv \
+    http://starrocks-fe:8040/api/warehouse/annual_sales_summary/_stream_load
+```
+
+#### 7.5.2 分区策略配合
+
+```sql
+-- 创建支持动态分区的聚合表
+CREATE TABLE annual_sales_summary_partitioned (
+    year_id INT NOT NULL,
+    region_code VARCHAR(50) NOT NULL,
+    product_category VARCHAR(100) NOT NULL,
+    total_sales DECIMAL(18,2) SUM DEFAULT "0",
+    total_orders BIGINT SUM DEFAULT "0"
+) ENGINE=OLAP
+AGGREGATE KEY(year_id, region_code, product_category)
+PARTITION BY RANGE(year_id) (
+    PARTITION p2021 VALUES [("2021"), ("2022")),
+    PARTITION p2022 VALUES [("2022"), ("2023")),
+    PARTITION p2023 VALUES [("2023"), ("2024"))
+)
+DISTRIBUTED BY HASH(region_code) BUCKETS 8
+PROPERTIES (
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "YEAR",
+    "dynamic_partition.start" = "-2",
+    "dynamic_partition.end" = "1",
+    "dynamic_partition.prefix" = "p",
+    "dynamic_partition.buckets" = "8"
+);
+```
+
+### 7.6 监控和调试
+
+#### 7.6.1 聚合过程监控
+
+```sql
+-- 创建聚合进度监控表
+CREATE TABLE aggregation_progress (
+    batch_id VARCHAR(64),
+    process_year INT,
+    process_month INT,
+    start_time DATETIME,
+    end_time DATETIME,
+    source_rows BIGINT,
+    target_rows BIGINT,
+    status ENUM('running', 'completed', 'failed'),
+    error_message TEXT,
+    PRIMARY KEY (batch_id, process_year, process_month)
+) ENGINE=OLAP
+DUPLICATE KEY(batch_id)
+DISTRIBUTED BY HASH(batch_id) BUCKETS 4;
+```
+
+#### 7.6.2 数据一致性验证
+
+```javascript
+// 在 Kettle 中验证聚合结果
+var sourceSum = getVariableFromDB(
+    "SELECT SUM(sale_amount) FROM sales_detail WHERE DATE_FORMAT(order_date, '%Y-%m') = '" + 
+    getVariable("PROCESS_YEAR") + "-" + getVariable("PROCESS_MONTH") + "'"
+);
+
+var targetSum = getVariableFromDB(
+    "SELECT SUM(total_sales) FROM annual_sales_summary WHERE year_id = " + 
+    getVariable("PROCESS_YEAR") + " AND last_updated >= '" + getVariable("BATCH_START_TIME") + "'"
+);
+
+var variance = Math.abs(sourceSum - targetSum);
+var tolerance = sourceSum * 0.001;  // 0.1% 容差
+
+if (variance > tolerance) {
+    writeToLog("e", "数据一致性检查失败：源数据合计=" + sourceSum + ", 目标数据合计=" + targetSum);
+    throw new Error("聚合结果不一致");
+} else {
+    writeToLog("i", "数据一致性验证通过：差异=" + variance + " (容差=" + tolerance + ")");
+}
+```
+
+### 7.7 最佳实践要点
+
+#### 7.7.1 循环处理建议
+- **循环粒度**：按月循环比按日循环更高效，减少网络开销
+- **错误隔离**：单月失败不影响其他月份处理
+- **进度保存**：记录每月处理状态，支持断点续传
+- **资源控制**：避免在高峰期运行大量聚合作业
+
+#### 7.7.2 聚合表设计原则
+- **合理选择聚合函数**：根据业务语义选择 SUM/MAX/MIN/REPLACE
+- **聚合键设计**：包含所有分组维度，避免过度聚合
+- **默认值设置**：为聚合列设置合适的默认值
+- **索引策略**：聚合键自动创建前缀索引，无需额外索引
+
+#### 7.7.3 性能优化要点
+- **批量大小**：每批处理 1-10 万条记录较为合适
+- **并发控制**：避免过多并发写入同一聚合表
+- **分区对齐**：源表分区策略与聚合表分区策略保持一致
+- **预聚合**：在源端先进行部分聚合，减少传输数据量
+
+通过合理的循环设计和聚合模型配置，可以高效地处理大规模历史数据的分批聚合需求。
+
+## 8. 最佳实践总结
+
+### 8.1 分片策略选择
 - **历史数据迁移**：优先使用时间范围分片，与 StarRocks 分区策略对应
 - **大表全量同步**：使用主键范围分片，确保数据完整性
 - **实时数据处理**：使用 Hash 分片，保证负载均衡
 
-### 7.2 并行度设置
+### 8.2 并行度设置
 - **CPU 密集型**：并行度 = CPU 核心数
 - **I/O 密集型**：并行度 = CPU 核心数 × 2
 - **内存受限型**：根据可用内存动态调整
 
-### 7.3 资源管理要点
+### 8.3 资源管理要点
 - 设置合理的 JVM 堆内存，通常为系统内存的 60-70%
 - 使用连接池避免频繁创建数据库连接
 - 实施流量控制，防止系统过载
 - 定期监控和清理临时文件
 
-### 7.4 错误处理策略
+### 8.4 错误处理策略
 - 实现分片级错误隔离，单个分片失败不影响整体
 - 采用指数退避重试策略，避免雪崩效应
 - 支持断点续传，提高处理效率
 - 建立完善的监控告警机制
 
-### 7.5 性能调优建议
+### 8.5 性能调优建议
 - 定期分析性能指标，识别瓶颈点
 - 优化 SQL 查询，使用合适的索引
 - 调整批量大小，平衡内存使用和处理效率
 - 使用 Stream Load 替代 INSERT 提升写入性能
 
-通过合理的批量处理策略，可以显著提升大数据量的 ETL 处理效率和系统稳定性。
+### 8.6 聚合表循环处理要点
+- **循环设计**：合理设计年度-月份嵌套循环，确保错误隔离
+- **聚合函数**：根据业务语义选择合适的聚合函数（SUM/MAX/MIN/REPLACE）
+- **性能优化**：配合 StarRocks 分区策略，使用 Stream Load 提升写入性能
+- **监控验证**：建立完善的进度监控和数据一致性验证机制
+
+通过合理的批量处理策略，可以显著提升大数据量的 ETL 处理效率和系统稳定性。聚合表配合循环处理为复杂的历史数据聚合场景提供了高效可靠的解决方案。
 
 ---
 ## 📖 导航
